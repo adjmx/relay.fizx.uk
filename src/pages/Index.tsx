@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, Upload } from 'lucide-react';
 
 const RELAY_URL = 'wss://relay.fizx.uk';
@@ -186,6 +186,11 @@ function useRelayStatus(wsUrl: string) {
   const [verifiedAt, setVerifiedAt] = useState<number | null>(null);
   const [fetching, setFetching] = useState<boolean>(false);
   const [nip11Error, setNip11Error] = useState<boolean>(false);
+  // Diff state: which fields changed vs the cached snapshot, and the last
+  // outcome ('verified' = identical to cache, 'updated' = something differed).
+  const prevInfoRef = useRef<RelayInfo | null>(cached?.info ?? null);
+  const [changedFields, setChangedFields] = useState<Set<string>>(new Set());
+  const [updateType, setUpdateType] = useState<'verified' | 'updated'>('verified');
 
   const refresh = useCallback(() => { setTick(t => t + 1); }, []);
 
@@ -210,9 +215,24 @@ function useRelayStatus(wsUrl: string) {
       .then((j: RelayInfo) => {
         if (cancelled) return;
         const now = Date.now() / 1000;
+        // Diff vs previous snapshot — populates `changedFields` so the table
+        // can highlight which rows are different.
+        const prev = prevInfoRef.current;
+        const changed = new Set<string>();
+        if (prev) {
+          const keys = new Set<string>([...Object.keys(prev), ...Object.keys(j)]);
+          for (const k of keys) {
+            const a = JSON.stringify((prev as Record<string, unknown>)[k] ?? null);
+            const b = JSON.stringify((j    as Record<string, unknown>)[k] ?? null);
+            if (a !== b) changed.add(k);
+          }
+        }
+        prevInfoRef.current = j;
         setInfo(j);
         setCachedAt(now);
         setVerifiedAt(now);
+        setChangedFields(changed);
+        setUpdateType(prev && changed.size > 0 ? 'updated' : 'verified');
         writeNip11Cache(j);
       })
       .catch((err) => {
@@ -284,7 +304,7 @@ function useRelayStatus(wsUrl: string) {
     };
   }, [wsUrl, tick, refresh]);
 
-  return { wsStatus, latencyMs, lastChecked, info, cachedAt, verifiedAt, fetching, nip11Error, refresh };
+  return { wsStatus, latencyMs, lastChecked, info, cachedAt, verifiedAt, fetching, nip11Error, changedFields, updateType, refresh };
 }
 
 function relTime(secAgo: number): string {
@@ -299,7 +319,7 @@ function relTime(secAgo: number): string {
 export default function Index() {
   // pubkey is read for shared-state sync; not displayed directly on this page.
   useNostrLogin();
-  const { wsStatus, latencyMs, lastChecked, info, cachedAt, verifiedAt, fetching, nip11Error, refresh } = useRelayStatus(RELAY_URL);
+  const { wsStatus, latencyMs, lastChecked, info, cachedAt, verifiedAt, fetching, nip11Error, changedFields, updateType, refresh } = useRelayStatus(RELAY_URL);
   const [tick, setTick] = useState(0);
   // Wall-clock tick (1Hz) drives both the 21-bar and the "verified Xs ago" chip.
   const [nowSec, setNowSec] = useState(() => Date.now() / 1000);
@@ -414,16 +434,28 @@ export default function Index() {
                   <span className="text-accent/80">verifying…</span>
                 </>
               )}
-              {!fetching && justVerified && (
+              {!fetching && justVerified && updateType === 'verified' && (
                 <>
                   <span className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_6px_rgba(52,211,153,0.7)] shrink-0" />
                   <span className="text-primary">verified just now</span>
                 </>
               )}
-              {!fetching && verifiedAgo != null && !justVerified && (
+              {!fetching && justVerified && updateType === 'updated' && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent shadow-[0_0_8px_rgba(167,139,250,0.8)] shrink-0" />
+                  <span className="text-accent">updated just now ({changedFields.size} {changedFields.size === 1 ? 'field' : 'fields'})</span>
+                </>
+              )}
+              {!fetching && verifiedAgo != null && !justVerified && updateType === 'verified' && (
                 <>
                   <span className="w-1.5 h-1.5 rounded-full bg-primary/50 shrink-0" />
                   <span className="text-muted-foreground/60">verified {relTime(verifiedAgo)}</span>
+                </>
+              )}
+              {!fetching && verifiedAgo != null && !justVerified && updateType === 'updated' && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent/40 shrink-0" />
+                  <span className="text-muted-foreground/60">updated {relTime(verifiedAgo)}</span>
                 </>
               )}
               {!fetching && verifiedAgo == null && cachedAgo != null && !nip11Error && (
@@ -448,20 +480,30 @@ export default function Index() {
           )}
           {info && (
             <>
+              {/* keyframe used by changed rows below — declared inline so it ships with the page */}
+              <style>{`@keyframes relayFieldChange{0%{background:rgba(167,139,250,0.22)}100%{background:transparent}}`}</style>
               <table className="w-full font-mono text-[11px]">
                 <tbody>
-                  <Row label="name"        value={info.name} />
-                  <Row label="description" value={info.description} />
-                  <Row label="pubkey"      value={info.pubkey} mono />
-                  <Row label="contact"     value={info.contact ?? '—'} />
-                  <Row label="software"    value={info.software} />
-                  <Row label="version"     value={info.version} />
+                  <Row label="name"        value={info.name}            highlight={changedFields.has('name')} />
+                  <Row label="description" value={info.description}     highlight={changedFields.has('description')} />
+                  <Row label="pubkey"      value={info.pubkey} mono     highlight={changedFields.has('pubkey')} />
+                  <Row label="contact"     value={info.contact ?? '—'}  highlight={changedFields.has('contact')} />
+                  <Row label="software"    value={info.software}        highlight={changedFields.has('software')} />
+                  <Row label="version"     value={info.version}         highlight={changedFields.has('version')} />
                 </tbody>
               </table>
               {info.supported_nips && info.supported_nips.length > 0 && (
                 <div>
-                  <p className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground/60 mb-2">supported NIPs</p>
-                  <div className="flex flex-wrap gap-1.5">
+                  <div className="flex items-baseline gap-2 mb-2">
+                    <p className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground/60">supported NIPs</p>
+                    {changedFields.has('supported_nips') && (
+                      <span className="text-[9px] font-mono uppercase tracking-widest text-accent/80">· changed</span>
+                    )}
+                  </div>
+                  <div
+                    className="flex flex-wrap gap-1.5"
+                    style={changedFields.has('supported_nips') ? { animation: 'relayFieldChange 4s ease-out forwards' } : undefined}
+                  >
                     {info.supported_nips.sort((a, b) => a - b).map(nip => (
                       <a key={nip} href={`https://github.com/nostr-protocol/nips/blob/master/${nip.toString().padStart(2,'0')}.md`}
                          target="_blank" rel="noopener noreferrer"
@@ -486,11 +528,17 @@ export default function Index() {
   );
 }
 
-function Row({ label, value, mono }: { label: string; value?: string; mono?: boolean }) {
+function Row({ label, value, mono, highlight }: { label: string; value?: string; mono?: boolean; highlight?: boolean }) {
   if (!value) return null;
   return (
-    <tr className="border-t border-border/40 first:border-t-0">
-      <td className="py-2 pr-4 align-top text-muted-foreground/70 w-32">{label}</td>
+    <tr
+      className="border-t border-border/40 first:border-t-0"
+      style={highlight ? { animation: 'relayFieldChange 4s ease-out forwards' } : undefined}
+    >
+      <td className="py-2 pr-4 align-top text-muted-foreground/70 w-32">
+        {label}
+        {highlight && <span className="ml-1.5 text-[9px] uppercase tracking-widest text-accent/80">changed</span>}
+      </td>
       <td className={`py-2 align-top text-foreground/85 break-all ${mono ? 'font-mono text-[10px]' : ''}`}>{value}</td>
     </tr>
   );
