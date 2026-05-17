@@ -164,22 +164,50 @@ function useRelayStatus(wsUrl: string) {
 
   const refresh = useCallback(() => { setTick(t => t + 1); }, []);
 
+  // ── NIP-11 fetch ───────────────────────────────────────────────────────────
+  // Separate effect so a misbehaving WS can't interfere with metadata loading.
+  // `cache: 'no-store'` bypasses any browser HTTP cache that may have keyed on
+  // the URL without considering the differing Accept header.
   useEffect(() => {
     let cancelled = false;
-    let retry: ReturnType<typeof setTimeout> | null = null;
-    setWsStatus('checking');
-    setLatencyMs(null);
     setNip11Error(false);
 
     const httpUrl = wsUrl.replace(/^wss:\/\//, 'https://').replace(/^ws:\/\//, 'http://');
-    fetch(httpUrl, { headers: { Accept: 'application/nostr+json' }, signal: AbortSignal.timeout(8000) })
-      .then(r => r.ok ? r.json() : Promise.reject(new Error(`http ${r.status}`)))
-      .then(j => { if (!cancelled) setInfo(j as RelayInfo); })
-      .catch(() => { if (!cancelled) setNip11Error(true); });
+    fetch(httpUrl, {
+      headers: { Accept: 'application/nostr+json' },
+      cache: 'no-store',
+    })
+      .then(r => {
+        if (!r.ok) throw new Error(`http ${r.status}`);
+        return r.json();
+      })
+      .then((j: RelayInfo) => {
+        if (cancelled) return;
+        setInfo(j);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // eslint-disable-next-line no-console
+        console.warn('[relay.fizx.uk] NIP-11 fetch failed:', err);
+        setNip11Error(true);
+      });
+
+    return () => { cancelled = true; };
+  }, [wsUrl, tick]);
+
+  // ── WebSocket connectivity probe ───────────────────────────────────────────
+  // Separate effect, separate cancellation. Auto-retries: 30s on failure,
+  // 5 min on success (refresh just re-runs both effects).
+  useEffect(() => {
+    let cancelled = false;
+    let ws: WebSocket | null = null;
+    let opened = false;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    setWsStatus('checking');
+    setLatencyMs(null);
 
     const t0 = Date.now();
-    let opened = false;
-    const wsTimeout = setTimeout(() => {
+    const giveUp = setTimeout(() => {
       if (!opened && !cancelled) {
         setWsStatus('offline');
         setLastChecked(new Date().toLocaleTimeString());
@@ -188,27 +216,28 @@ function useRelayStatus(wsUrl: string) {
     }, 8000);
 
     try {
-      const ws = new WebSocket(wsUrl);
+      ws = new WebSocket(wsUrl);
       ws.onopen = () => {
         opened = true;
-        clearTimeout(wsTimeout);
-        if (cancelled) { ws.close(); return; }
+        clearTimeout(giveUp);
+        if (cancelled || !ws) return;
         setLatencyMs(Date.now() - t0);
         setWsStatus('online');
         setLastChecked(new Date().toLocaleTimeString());
         ws.close();
-        retry = setTimeout(refresh, 5 * 60 * 1000); // refresh every 5 min while online
+        retry = setTimeout(refresh, 5 * 60 * 1000);
       };
       ws.onerror = () => {
-        if (!opened && !cancelled) {
-          clearTimeout(wsTimeout);
-          setWsStatus('offline');
-          setLastChecked(new Date().toLocaleTimeString());
-          retry = setTimeout(refresh, 30000);
-        }
+        if (opened || cancelled) return;
+        clearTimeout(giveUp);
+        setWsStatus('offline');
+        setLastChecked(new Date().toLocaleTimeString());
+        retry = setTimeout(refresh, 30000);
       };
-    } catch {
-      clearTimeout(wsTimeout);
+    } catch (err) {
+      clearTimeout(giveUp);
+      // eslint-disable-next-line no-console
+      console.warn('[relay.fizx.uk] WS open failed:', err);
       setWsStatus('offline');
       setLastChecked(new Date().toLocaleTimeString());
       retry = setTimeout(refresh, 30000);
@@ -216,8 +245,9 @@ function useRelayStatus(wsUrl: string) {
 
     return () => {
       cancelled = true;
-      clearTimeout(wsTimeout);
+      clearTimeout(giveUp);
       if (retry) clearTimeout(retry);
+      if (ws && ws.readyState <= 1) try { ws.close(); } catch { /* */ }
     };
   }, [wsUrl, tick, refresh]);
 
