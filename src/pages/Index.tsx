@@ -154,23 +154,49 @@ interface RelayInfo {
 }
 type WsStatus = 'checking' | 'online' | 'offline';
 
+// localStorage cache for NIP-11 so the table can render instantly on page load.
+const CACHE_KEY = 'relay.fizx.uk.nip11.cache.v1';
+function readNip11Cache(): { info: RelayInfo; cachedAt: number } | null {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.cachedAt !== 'number') return null;
+    if (!parsed.info || typeof parsed.info !== 'object') return null;
+    return parsed;
+  } catch { return null; }
+}
+function writeNip11Cache(info: RelayInfo) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ info, cachedAt: Date.now() / 1000 }));
+  } catch { /* */ }
+}
+
 function useRelayStatus(wsUrl: string) {
   const [wsStatus, setWsStatus] = useState<WsStatus>('checking');
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [lastChecked, setLastChecked] = useState<string | null>(null);
-  const [info, setInfo] = useState<RelayInfo | null>(null);
-  const [nip11Error, setNip11Error] = useState<boolean>(false);
   const [tick, setTick] = useState(0);
+
+  // NIP-11 state — initialize from cache (instant render on page load)
+  const cached = readNip11Cache();
+  const [info, setInfo] = useState<RelayInfo | null>(cached?.info ?? null);
+  const [cachedAt, setCachedAt] = useState<number | null>(cached?.cachedAt ?? null);
+  const [verifiedAt, setVerifiedAt] = useState<number | null>(null);
+  const [fetching, setFetching] = useState<boolean>(false);
+  const [nip11Error, setNip11Error] = useState<boolean>(false);
 
   const refresh = useCallback(() => { setTick(t => t + 1); }, []);
 
   // ── NIP-11 fetch ───────────────────────────────────────────────────────────
-  // Separate effect so a misbehaving WS can't interfere with metadata loading.
-  // `cache: 'no-store'` bypasses any browser HTTP cache that may have keyed on
-  // the URL without considering the differing Accept header.
+  // Verifies against the live relay. On success, updates cache + verifiedAt
+  // (which triggers the freshness chip). On failure, leaves cached data
+  // visible and surfaces a "stale — fetch failed" hint in the chip.
   useEffect(() => {
     let cancelled = false;
     setNip11Error(false);
+    setFetching(true);
 
     const httpUrl = wsUrl.replace(/^wss:\/\//, 'https://').replace(/^ws:\/\//, 'http://');
     fetch(httpUrl, {
@@ -183,13 +209,20 @@ function useRelayStatus(wsUrl: string) {
       })
       .then((j: RelayInfo) => {
         if (cancelled) return;
+        const now = Date.now() / 1000;
         setInfo(j);
+        setCachedAt(now);
+        setVerifiedAt(now);
+        writeNip11Cache(j);
       })
       .catch((err) => {
         if (cancelled) return;
         // eslint-disable-next-line no-console
         console.warn('[relay.fizx.uk] NIP-11 fetch failed:', err);
         setNip11Error(true);
+      })
+      .finally(() => {
+        if (!cancelled) setFetching(false);
       });
 
     return () => { cancelled = true; };
@@ -251,20 +284,38 @@ function useRelayStatus(wsUrl: string) {
     };
   }, [wsUrl, tick, refresh]);
 
-  return { wsStatus, latencyMs, lastChecked, info, nip11Error, refresh };
+  return { wsStatus, latencyMs, lastChecked, info, cachedAt, verifiedAt, fetching, nip11Error, refresh };
+}
+
+function relTime(secAgo: number): string {
+  if (secAgo < 5)     return 'just now';
+  if (secAgo < 60)    return `${Math.floor(secAgo)}s ago`;
+  if (secAgo < 3600)  return `${Math.floor(secAgo / 60)}m ago`;
+  if (secAgo < 86400) return `${Math.floor(secAgo / 3600)}h ago`;
+  return `${Math.floor(secAgo / 86400)}d ago`;
 }
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 export default function Index() {
   // pubkey is read for shared-state sync; not displayed directly on this page.
   useNostrLogin();
-  const { wsStatus, latencyMs, lastChecked, info, nip11Error, refresh } = useRelayStatus(RELAY_URL);
+  const { wsStatus, latencyMs, lastChecked, info, cachedAt, verifiedAt, fetching, nip11Error, refresh } = useRelayStatus(RELAY_URL);
   const [tick, setTick] = useState(0);
+  // Wall-clock tick (1Hz) drives both the 21-bar and the "verified Xs ago" chip.
+  const [nowSec, setNowSec] = useState(() => Date.now() / 1000);
 
   useEffect(() => {
-    const id = setInterval(() => setTick(t => (t < SQUARE_COUNT ? t + 1 : 0)), 1000);
+    const id = setInterval(() => {
+      setTick(t => (t < SQUARE_COUNT ? t + 1 : 0));
+      setNowSec(Date.now() / 1000);
+    }, 1000);
     return () => clearInterval(id);
   }, []);
+
+  // Freshness chip state machine
+  const verifiedAgo = verifiedAt != null ? nowSec - verifiedAt : null;
+  const cachedAgo   = cachedAt   != null ? nowSec - cachedAt   : null;
+  const justVerified = verifiedAgo != null && verifiedAgo < 2;
 
   const dotClass =
     wsStatus === 'online'  ? 'bg-primary shadow-[0_0_7px_rgba(52,211,153,0.5)]' :
@@ -356,8 +407,40 @@ export default function Index() {
           <div className="flex items-center gap-2">
             <span className="h-[2px] bg-primary/50 shrink-0" style={{ width: 'calc((100% - 60px) / 21)' }} />
             <h2 className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground">NIP-11 — relay information</h2>
+            <div className="ml-auto flex items-center gap-1.5 text-[10px] font-mono">
+              {fetching && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shrink-0" />
+                  <span className="text-accent/80">verifying…</span>
+                </>
+              )}
+              {!fetching && justVerified && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_6px_rgba(52,211,153,0.7)] shrink-0" />
+                  <span className="text-primary">verified just now</span>
+                </>
+              )}
+              {!fetching && verifiedAgo != null && !justVerified && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary/50 shrink-0" />
+                  <span className="text-muted-foreground/60">verified {relTime(verifiedAgo)}</span>
+                </>
+              )}
+              {!fetching && verifiedAgo == null && cachedAgo != null && !nip11Error && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground/40 shrink-0" />
+                  <span className="text-muted-foreground/60">cached {relTime(cachedAgo)}</span>
+                </>
+              )}
+              {!fetching && nip11Error && cachedAgo != null && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400/70 shrink-0" />
+                  <span className="text-amber-400/80">stale · cache {relTime(cachedAgo)}</span>
+                </>
+              )}
+            </div>
           </div>
-          {nip11Error && (
+          {nip11Error && !info && (
             <p className="text-[11px] font-mono text-amber-400/70">NIP-11 document could not be fetched. The relay daemon may not be serving it on this endpoint.</p>
           )}
           {!nip11Error && !info && (
