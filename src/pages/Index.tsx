@@ -370,7 +370,7 @@ export default function Index() {
         {/* Hero */}
         <div>
           <div className="flex items-center justify-between gap-3 mb-2">
-            <AnimatedTitle accent="relay" rest="²" from="#60a5fa" to="#34d399" suffixRgba="rgba(96,165,250,0.55)" />
+            <AnimatedTitle accent="relay" rest="" from="#60a5fa" to="#34d399" suffixRgba="rgba(96,165,250,0.55)" />
             <NstartHand />
           </div>
 
