@@ -81,7 +81,9 @@ fi
 # rsync -a preserves source mtimes, so timestamps on synced files reflect
 # the local build, not the deploy moment. This is normal.
 echo "Syncing files..."
-rsync -avz --delete \
+# nginx only reads, so force world-readable modes rather than copying whatever
+# the local files happen to have. --chmod needs real rsync (not macOS openrsync).
+rsync -avz --delete --chmod=D755,F644 \
     --exclude='.DS_Store' \
     --exclude='*.log' \
     --exclude='.git' \
