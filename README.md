@@ -30,11 +30,13 @@ npm run dev
 ## Build + deploy
 
 ```bash
-npm run build
-rsync -avz --delete -e "ssh -p 2121" dist/ root@88.218.206.187:/var/www/relay.fizx.uk/ \
-  --exclude .well-known --exclude relay-stats.json
+./deploy.sh
 ```
 
-> The `.well-known/nostr.json` (NIP-05 file) and `relay-stats.json` (cron-rewritten) live only on the server — the `--exclude` flags prevent `--delete` from wiping them.
+Builds, then rsyncs `dist/` to the webroot. The script names the server by an
+SSH host alias (`fizx.uk` in `~/.ssh/config`), which carries the user, port and
+key.
 
-VPS: `88.218.206.187`. Full server / nginx / SSL / DNS notes for the wider deployment live in the local `code_gh/adjmx/CLAUDE.md` (not pushed; this README is the public-facing summary).
+> The `.well-known/nostr.json` (NIP-05 file) and `relay-stats.json` (cron-rewritten) live only on the server. The script excludes both, so `--delete` does not wipe them — keep those excludes if you ever rsync by hand.
+
+Server addresses and the nginx / SSL / DNS notes for the wider deployment live in the local `code_gh/adjmx/CLAUDE.md` (not pushed; this README is the public-facing summary).
